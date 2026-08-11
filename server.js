@@ -1,209 +1,315 @@
-// server.js - Full Code cho Render với PostgreSQL
+// ============================================
+// BOTBYPASS API - FIXED (Không dùng database)
+// ============================================
+
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// ============ MIDDLEWARE ============
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// ============ KẾT NỐI DATABASE ============
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://user:pass@localhost:5432/stock_db',
-    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+// ============ STORAGE TRONG BỘ NHỚ (RAM) ============
+// Dữ liệu sẽ mất khi server restart, nhưng tạm thời dùng được
+const stockStorage = {};
+let requestLogs = [];
+
+// ============ HÀM TIỆN ÍCH ============
+const getTimestamp = () => new Date().toISOString();
+
+const log = (message, type = 'INFO') => {
+    const prefix = {
+        INFO: '📘',
+        SUCCESS: '✅',
+        WARNING: '⚠️',
+        ERROR: '❌',
+        DEBUG: '🔍'
+    };
+    console.log(`[${getTimestamp()}] ${prefix[type] || '📘'} ${message}`);
+};
+
+// ============ TRANG CHỦ ============
+app.get('/', (req, res) => {
+    res.json({
+        name: '🚀 BotBypass API',
+        version: '2.0.0',
+        status: '🟢 Online',
+        storage: 'In-Memory (RAM)',
+        total_items: Object.keys(stockStorage).length,
+        endpoints: {
+            'POST /api/update-stock': 'Gửi cập nhật stock (chỉ lưu khi > 0)',
+            'GET /api/stock': 'Lấy tất cả stock (>0)',
+            'GET /api/stock/:shop': 'Lấy stock theo shop',
+            'GET /api/stock/:shop/:item': 'Lấy stock của 1 item',
+            'DELETE /api/stock/:shop/:item': 'Xóa item',
+            'GET /api/dashboard': 'Thống kê',
+            'GET /api/logs': 'Xem log gần đây',
+            'DELETE /api/reset': 'Reset toàn bộ (dev)',
+            'GET /health': 'Health check'
+        },
+        example: {
+            'POST /api/update-stock': {
+                method: 'POST',
+                body: {
+                    shop: 'SeedShop',
+                    item: 'Carrot',
+                    stock: 15
+                }
+            }
+        }
+    });
 });
 
-// Tạo bảng tự động
-pool.query(`
-    CREATE TABLE IF NOT EXISTS stock_items (
-        id SERIAL PRIMARY KEY,
-        shop_name VARCHAR(100) NOT NULL,
-        item_name VARCHAR(100) NOT NULL,
-        stock INT DEFAULT 0,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(shop_name, item_name)
-    )
-`).then(() => {
-    console.log('✅ Bảng stock_items đã sẵn sàng');
-}).catch(err => {
-    console.error('❌ Lỗi tạo bảng:', err.message);
+// ============ HEALTH CHECK ============
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        timestamp: getTimestamp(),
+        uptime: process.uptime(),
+        storage_size: Object.keys(stockStorage).length,
+        memory_usage: process.memoryUsage()
+    });
+});
+
+// ============ LOGS ============
+app.get('/api/logs', (req, res) => {
+    res.json({
+        success: true,
+        count: requestLogs.length,
+        logs: requestLogs.slice(-50) // 50 log gần nhất
+    });
 });
 
 // ============ API ENDPOINTS ============
 
-// 1. Nhận dữ liệu từ Roblox (CHỈ LƯU KHI stock > 0)
-app.post('/api/update-stock', async (req, res) => {
+// 1. NHẬN DỮ LIỆU TỪ ROBLOX
+app.post('/api/update-stock', (req, res) => {
     const { shop, item, stock } = req.body;
     
-    console.log(`📥 Nhận: ${shop} | ${item} = ${stock}`);
+    // Validate
+    if (!shop || !item || stock === undefined) {
+        const error = 'Thiếu tham số: shop, item, stock là bắt buộc';
+        log(error, 'ERROR');
+        return res.status(400).json({ success: false, error });
+    }
+    
+    log(`📥 Nhận: ${shop} | ${item} = ${stock}`, 'INFO');
+    
+    // Lưu log
+    requestLogs.push({
+        type: 'update',
+        shop,
+        item,
+        stock,
+        timestamp: getTimestamp()
+    });
+    if (requestLogs.length > 100) requestLogs.shift();
     
     // ❌ BỎ QUA NẾU stock <= 0
     if (stock <= 0) {
+        log(`⛔ Bỏ qua ${item} vì stock = ${stock}`, 'WARNING');
         return res.json({
             success: false,
             message: `⛔ Bỏ qua ${item} vì stock = ${stock} (không lưu)`
         });
     }
     
+    // ✅ LƯU VÀO RAM NẾU stock > 0
+    const key = `${shop}_${item}`;
+    stockStorage[key] = {
+        shop,
+        item,
+        stock,
+        last_updated: getTimestamp()
+    };
+    
+    log(`✅ Đã lưu: ${shop} | ${item} = ${stock}`, 'SUCCESS');
+    res.json({
+        success: true,
+        message: `✅ Đã cập nhật ${item} = ${stock}`,
+        data: { shop, item, stock, timestamp: getTimestamp() }
+    });
+});
+
+// 2. LẤY TẤT CẢ STOCK
+app.get('/api/stock', (req, res) => {
     try {
-        // ✅ LƯU VÀO DB NẾU stock > 0
-        const query = `
-            INSERT INTO stock_items (shop_name, item_name, stock) 
-            VALUES ($1, $2, $3) 
-            ON CONFLICT (shop_name, item_name) 
-            DO UPDATE SET stock = $3, last_updated = CURRENT_TIMESTAMP
-        `;
-        await pool.query(query, [shop, item, stock]);
-        
-        console.log(`✅ Đã lưu: ${shop} | ${item} = ${stock}`);
+        const data = Object.values(stockStorage).filter(item => item.stock > 0);
+        log(`📤 Lấy danh sách: ${data.length} items`, 'DEBUG');
         res.json({
             success: true,
-            message: `✅ Đã cập nhật ${item} = ${stock}`,
-            data: { shop, item, stock }
+            count: data.length,
+            data: data.sort((a, b) => a.shop.localeCompare(b.shop) || a.item.localeCompare(b.item))
         });
     } catch (err) {
-        console.error('❌ Lỗi DB:', err.message);
+        log(`❌ Lỗi lấy stock: ${err.message}`, 'ERROR');
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// 2. Lấy tất cả stock (chỉ lấy > 0)
-app.get('/api/stock', async (req, res) => {
-    try {
-        const result = await pool.query(
-            'SELECT * FROM stock_items WHERE stock > 0 ORDER BY shop_name, item_name'
-        );
-        res.json({
-            success: true,
-            count: result.rows.length,
-            data: result.rows
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 3. Lấy stock theo shop
-app.get('/api/stock/:shopName', async (req, res) => {
+// 3. LẤY STOCK THEO SHOP
+app.get('/api/stock/:shopName', (req, res) => {
     const { shopName } = req.params;
     
     try {
-        const result = await pool.query(
-            'SELECT * FROM stock_items WHERE shop_name = $1 AND stock > 0',
-            [shopName]
-        );
+        const data = Object.values(stockStorage)
+            .filter(item => item.shop === shopName && item.stock > 0)
+            .sort((a, b) => a.item.localeCompare(b.item));
+        
+        log(`📤 Lấy stock shop ${shopName}: ${data.length} items`, 'DEBUG');
         res.json({
             success: true,
             shop: shopName,
-            count: result.rows.length,
-            data: result.rows
+            count: data.length,
+            data: data
         });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// 4. Lấy stock của 1 item cụ thể
-app.get('/api/stock/:shopName/:itemName', async (req, res) => {
+// 4. LẤY STOCK CỦA 1 ITEM
+app.get('/api/stock/:shopName/:itemName', (req, res) => {
     const { shopName, itemName } = req.params;
+    const key = `${shopName}_${itemName}`;
     
-    try {
-        const result = await pool.query(
-            'SELECT * FROM stock_items WHERE shop_name = $1 AND item_name = $2',
-            [shopName, itemName]
-        );
-        
-        if (result.rows.length === 0) {
-            return res.json({
-                success: false,
-                message: `Không tìm thấy ${itemName} ở ${shopName}`
-            });
-        }
-        
-        res.json({
-            success: true,
-            data: result.rows[0]
+    const item = stockStorage[key];
+    if (!item || item.stock <= 0) {
+        return res.json({
+            success: false,
+            message: `Không tìm thấy ${itemName} ở ${shopName} hoặc stock = 0`
         });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
     }
+    
+    res.json({
+        success: true,
+        data: item
+    });
 });
 
-// 5. Xóa item (khi stock về 0)
-app.delete('/api/stock/:shopName/:itemName', async (req, res) => {
+// 5. XÓA ITEM
+app.delete('/api/stock/:shopName/:itemName', (req, res) => {
     const { shopName, itemName } = req.params;
+    const key = `${shopName}_${itemName}`;
     
+    if (!stockStorage[key]) {
+        return res.json({
+            success: false,
+            message: `Không tìm thấy ${itemName} ở ${shopName}`
+        });
+    }
+    
+    const deleted = stockStorage[key];
+    delete stockStorage[key];
+    log(`🗑️ Đã xóa: ${shopName} | ${itemName}`, 'WARNING');
+    
+    res.json({
+        success: true,
+        message: `Đã xóa ${itemName} khỏi ${shopName}`,
+        deleted: deleted
+    });
+});
+
+// 6. DASHBOARD
+app.get('/api/dashboard', (req, res) => {
     try {
-        await pool.query(
-            'DELETE FROM stock_items WHERE shop_name = $1 AND item_name = $2',
-            [shopName, itemName]
-        );
+        const items = Object.values(stockStorage).filter(item => item.stock > 0);
+        const shops = {};
+        let totalStock = 0;
+        let maxStock = 0;
+        let minStock = Infinity;
+        
+        items.forEach(item => {
+            totalStock += item.stock;
+            if (item.stock > maxStock) maxStock = item.stock;
+            if (item.stock < minStock) minStock = item.stock;
+            shops[item.shop] = (shops[item.shop] || 0) + 1;
+        });
+        
+        const shopStats = Object.keys(shops).map(shop => ({
+            shop,
+            item_count: shops[shop],
+            items: items.filter(item => item.shop === shop)
+        }));
+        
         res.json({
             success: true,
-            message: `Đã xóa ${itemName} khỏi ${shopName}`
+            statistics: {
+                total_items: items.length,
+                total_stock: totalStock,
+                total_shops: Object.keys(shops).length,
+                max_stock: maxStock,
+                min_stock: minStock === Infinity ? 0 : minStock,
+                avg_stock: items.length > 0 ? Math.round(totalStock / items.length) : 0
+            },
+            shops: shopStats,
+            top_items: items
+                .sort((a, b) => b.stock - a.stock)
+                .slice(0, 5),
+            last_updated: getTimestamp()
         });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// 6. Dashboard - Thống kê
-app.get('/api/dashboard', async (req, res) => {
-    try {
-        // Thống kê tổng hợp
-        const statsResult = await pool.query(`
-            SELECT 
-                COUNT(*) as total_items,
-                SUM(stock) as total_stock,
-                COUNT(DISTINCT shop_name) as total_shops,
-                MAX(stock) as max_stock,
-                MIN(stock) as min_stock
-            FROM stock_items 
-            WHERE stock > 0
-        `);
-        
-        // Thống kê theo shop
-        const shopsResult = await pool.query(`
-            SELECT shop_name, COUNT(*) as item_count, SUM(stock) as total_stock
-            FROM stock_items 
-            WHERE stock > 0
-            GROUP BY shop_name
-            ORDER BY shop_name
-        `);
-        
-        res.json({
-            success: true,
-            statistics: statsResult.rows[0],
-            shops: shopsResult.rows
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+// 7. RESET TOÀN BỘ
+app.delete('/api/reset', (req, res) => {
+    const count = Object.keys(stockStorage).length;
+    for (const key in stockStorage) {
+        delete stockStorage[key];
     }
+    log(`🗑️ Reset toàn bộ: ${count} items đã xóa`, 'WARNING');
+    res.json({
+        success: true,
+        message: `🗑️ Đã xóa ${count} items khỏi bộ nhớ`,
+        deleted_count: count
+    });
 });
 
-// 7. Health Check (cho Render)
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// ============ XỬ LÝ LỖI 404 ============
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint không tồn tại',
+        available_endpoints: [
+            '/',
+            '/health',
+            '/api/logs',
+            'POST /api/update-stock',
+            'GET /api/stock',
+            'GET /api/stock/:shop',
+            'GET /api/stock/:shop/:item',
+            'DELETE /api/stock/:shop/:item',
+            'GET /api/dashboard',
+            'DELETE /api/reset'
+        ]
+    });
 });
 
 // ============ START SERVER ============
 app.listen(PORT, () => {
     console.log(`
-    🚀 API ĐANG CHẠY TẠI: http://localhost:${PORT}
+    🚀 BOTBYPASS API ĐANG CHẠY
+    📡 URL: http://localhost:${PORT}
+    💾 Storage: In-Memory (RAM)
     📋 ENDPOINTS:
-    - POST   /api/update-stock     (Nhận từ Roblox)
-    - GET    /api/stock            (Lấy tất cả)
-    - GET    /api/stock/:shop      (Lấy theo shop)
+    - GET    /                      (Trang chủ)
+    - GET    /health                (Health check)
+    - GET    /api/logs              (Xem logs)
+    - POST   /api/update-stock      (Nhận từ Roblox)
+    - GET    /api/stock             (Lấy tất cả)
+    - GET    /api/stock/:shop       (Lấy theo shop)
     - GET    /api/stock/:shop/:item (Lấy 1 item)
     - DELETE /api/stock/:shop/:item (Xóa item)
-    - GET    /api/dashboard        (Thống kê)
-    - GET    /health               (Health check)
+    - GET    /api/dashboard         (Thống kê)
+    - DELETE /api/reset             (Reset toàn bộ)
     `);
 });
 
-// Xử lý lỗi không bắt được
+// ============ XỬ LÝ LỖI TOÀN CỤC ============
 process.on('uncaughtException', (err) => {
     console.error('❌ Uncaught Exception:', err);
 });
